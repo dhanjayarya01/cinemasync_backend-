@@ -2,18 +2,16 @@ import express from 'express';
 import http from 'http';
 import { Server as socketIo } from 'socket.io';
 import cors from 'cors';
-import { v4 as uuidv4 } from 'uuid';
-import path from 'path';
-import fs from 'fs';
+
 
 
 const app = express();
 const server = http.createServer(app);
 
-// Setup Socket.io
+
 const io = new socketIo(server, {
   cors: {
-    origin: "http://localhost:3000", // Frontend origin
+    origin: "*", 
     methods: ["GET", "POST"]
   }
 });
