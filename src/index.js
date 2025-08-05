@@ -2,12 +2,18 @@ import express from 'express';
 import http from 'http';
 import { Server as socketIo } from 'socket.io';
 import cors from 'cors';
-import { OAuth2Client } from 'google-auth-library';
-import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
+import connectDB from './config/database.js';
+import authRoutes from './routes/auth.js';
+import roomRoutes from './routes/rooms.js';
+import Room from './models/Room.js';
+import User from './models/User.js';
 
 // Load environment variables
 dotenv.config();
+
+// Connect to database
+connectDB();
 
 const app = express();
 const server = http.createServer(app);
@@ -26,212 +32,278 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Initialize Google OAuth client
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/rooms', roomRoutes);
 
-// In-memory user storage (in production, use a database)
-const users = new Map();
-
-// Middleware to verify JWT token
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    req.user = user;
-    next();
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    success: true, 
+    message: 'Server is running',
+    timestamp: new Date().toISOString()
   });
-};
-
-// Google OAuth verification endpoint
-app.post('/api/auth/google', async (req, res) => {
-  try {
-    const { credential } = req.body;
-    
-    if (!credential) {
-      return res.status(400).json({ error: 'Google credential is required' });
-    }
-
-    // Verify the Google ID token
-    const ticket = await googleClient.verifyIdToken({
-      idToken: credential,
-      audience: process.env.GOOGLE_CLIENT_ID
-    });
-
-    const payload = ticket.getPayload();
-    const { sub: googleId, email, name, picture } = payload;
-
-    // Create or update user
-    let user = users.get(googleId);
-    if (!user) {
-      user = {
-        id: googleId,
-        email,
-        name,
-        picture,
-        createdAt: new Date().toISOString()
-      };
-      users.set(googleId, user);
-    } else {
-      // Update existing user info
-      user.name = name;
-      user.picture = picture;
-      user.email = email;
-    }
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        id: user.id, 
-        email: user.email, 
-        name: user.name 
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.json({
-      success: true,
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        picture: user.picture
-      }
-    });
-
-  } catch (error) {
-    console.error('Google OAuth error:', error);
-    res.status(500).json({ error: 'Authentication failed' });
-  }
-});
-
-// Get user profile
-app.get('/api/auth/profile', authenticateToken, (req, res) => {
-  const user = users.get(req.user.id);
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-  
-  res.json({
-    id: user.id,
-    email: user.email,
-    name: user.name,
-    picture: user.picture
-  });
-});
-
-// Logout endpoint
-app.post('/api/auth/logout', authenticateToken, (req, res) => {
-  // In a real application, you might want to blacklist the token
-  res.json({ success: true, message: 'Logged out successfully' });
-});
-
-const rooms = new Map();
-
-// API Routes
-app.get('/api/rooms', (req, res) => {
-  const roomList = Array.from(rooms.keys()).map(roomId => ({
-    id: roomId,
-    participants: rooms.get(roomId).participants.length,
-    hasVideo: !!rooms.get(roomId).videoFile
-  }));
-  res.json(roomList);
-});
-
-app.post('/api/create-room', (req, res) => {
-  const { roomId } = req.body;
-  if (rooms.has(roomId)) {
-    return res.status(400).json({ error: 'Room already exists' });
-  }
-  
-  rooms.set(roomId, {
-    participants: [],
-    host: null,
-    videoFile: null,
-    isPlaying: false,
-    currentTime: 0
-  });
-  
-  res.json({ success: true, roomId });
 });
 
 // Socket.io connection handling
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  socket.on('join-room', (roomId) => {
-    socket.join(roomId);
-    
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, {
-        participants: [],
-        host: null,
-        videoFile: null,
-        isPlaying: false,
-        currentTime: 0
+  // Store user info in socket
+  socket.userId = null;
+  socket.roomId = null;
+
+  // Authenticate socket connection
+  socket.on('authenticate', async (data) => {
+    try {
+      const { token } = data;
+      
+      if (!token) {
+        socket.emit('auth-error', { error: 'Token required' });
+        return;
+      }
+
+      // Verify token and get user
+      const jwt = require('jsonwebtoken');
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const user = await User.findById(decoded.id);
+
+      if (!user) {
+        socket.emit('auth-error', { error: 'Invalid token' });
+        return;
+      }
+
+      socket.userId = user._id;
+      socket.user = {
+        id: user._id,
+        name: user.name,
+        picture: user.picture
+      };
+
+      // Update user online status
+      await user.updateOnlineStatus(true);
+
+      socket.emit('authenticated', {
+        user: socket.user
       });
+
+      console.log(`User ${user.name} authenticated: ${socket.id}`);
+    } catch (error) {
+      console.error('Socket authentication error:', error);
+      socket.emit('auth-error', { error: 'Authentication failed' });
     }
-    
-    const room = rooms.get(roomId);
-    room.participants.push(socket.id);
-    
-    // Set first user as host
-    if (!room.host) {
-      room.host = socket.id;
-    }
-    
-    // Send room info to the joining user
-    socket.emit('room-info', {
-      participants: room.participants,
-      host: room.host,
-      videoFile: room.videoFile,
-      isPlaying: room.isPlaying,
-      currentTime: room.currentTime
-    });
-    
-    // Notify other users
-    socket.to(roomId).emit('user-joined', socket.id);
-    io.to(roomId).emit('room-updated', {
-      participants: room.participants,
-      host: room.host
-    });
-    
-    console.log(`User ${socket.id} joined room ${roomId}`);
   });
 
-  socket.on('leave-room', (roomId) => {
-    socket.leave(roomId);
-    
-    if (rooms.has(roomId)) {
-      const room = rooms.get(roomId);
-      room.participants = room.participants.filter(id => id !== socket.id);
+  // Join room
+  socket.on('join-room', async (data) => {
+    try {
+      const { roomId } = data;
       
-      // If host leaves, assign new host
-      if (room.host === socket.id && room.participants.length > 0) {
-        room.host = room.participants[0];
+      if (!socket.userId) {
+        socket.emit('error', { error: 'Not authenticated' });
+        return;
       }
-      
-      // If room is empty, delete it
-      if (room.participants.length === 0) {
-        rooms.delete(roomId);
-      } else {
-        io.to(roomId).emit('room-updated', {
-          participants: room.participants,
-          host: room.host
+
+      const room = await Room.findById(roomId)
+        .populate('host', 'name picture')
+        .populate('participants.user', 'name picture');
+
+      if (!room) {
+        socket.emit('error', { error: 'Room not found' });
+        return;
+      }
+
+      // Check if user can join
+      const canJoin = room.canUserJoin(socket.userId);
+      if (!canJoin.canJoin) {
+        socket.emit('error', { error: canJoin.reason });
+        return;
+      }
+
+      // Join socket room
+      socket.join(roomId);
+      socket.roomId = roomId;
+
+      // Add user to room participants
+      await room.addParticipant(socket.userId);
+
+      // Get updated room info
+      const updatedRoom = await Room.findById(roomId)
+        .populate('host', 'name picture')
+        .populate('participants.user', 'name picture');
+
+      // Send room info to the joining user
+      socket.emit('room-joined', {
+        room: {
+          id: updatedRoom._id,
+          name: updatedRoom.name,
+          host: {
+            id: updatedRoom.host._id,
+            name: updatedRoom.host.name,
+            picture: updatedRoom.host.picture
+          },
+          movie: updatedRoom.movie,
+          videoFile: updatedRoom.videoFile,
+          status: updatedRoom.status,
+          playbackState: updatedRoom.playbackState,
+          settings: updatedRoom.settings,
+          participants: updatedRoom.participants.map(p => ({
+            user: {
+              id: p.user._id,
+              name: p.user.name,
+              picture: p.user.picture
+            },
+            joinedAt: p.joinedAt,
+            isHost: p.isHost,
+            isActive: p.isActive
+          }))
+        }
+      });
+
+      // Notify other users
+      socket.to(roomId).emit('user-joined', {
+        user: socket.user,
+        participants: updatedRoom.participants.map(p => ({
+          user: {
+            id: p.user._id,
+            name: p.user.name,
+            picture: p.user.picture
+          },
+          isHost: p.isHost,
+          isActive: p.isActive
+        }))
+      });
+
+      console.log(`User ${socket.user.name} joined room ${roomId}`);
+    } catch (error) {
+      console.error('Join room error:', error);
+      socket.emit('error', { error: 'Failed to join room' });
+    }
+  });
+
+  // Leave room
+  socket.on('leave-room', async () => {
+    try {
+      if (!socket.roomId || !socket.userId) {
+        return;
+      }
+
+      const room = await Room.findById(socket.roomId);
+      if (room) {
+        await room.removeParticipant(socket.userId);
+        
+        // Get updated room info
+        const updatedRoom = await Room.findById(socket.roomId)
+          .populate('participants.user', 'name picture');
+
+        // Notify other users
+        socket.to(socket.roomId).emit('user-left', {
+          user: socket.user,
+          participants: updatedRoom.participants.map(p => ({
+            user: {
+              id: p.user._id,
+              name: p.user.name,
+              picture: p.user.picture
+            },
+            isHost: p.isHost,
+            isActive: p.isActive
+          }))
         });
       }
+
+      socket.leave(socket.roomId);
+      socket.roomId = null;
+
+      console.log(`User ${socket.user?.name} left room`);
+    } catch (error) {
+      console.error('Leave room error:', error);
     }
-    
-    console.log(`User ${socket.id} left room ${roomId}`);
+  });
+
+  // Video control events
+  socket.on('video-play', async (data) => {
+    try {
+      if (!socket.roomId || !socket.userId) return;
+
+      const room = await Room.findById(socket.roomId);
+      if (!room || room.host.toString() !== socket.userId.toString()) return;
+
+      await room.updatePlaybackState({ isPlaying: true });
+      
+      socket.to(socket.roomId).emit('video-play', {
+        currentTime: room.playbackState.currentTime
+      });
+    } catch (error) {
+      console.error('Video play error:', error);
+    }
+  });
+
+  socket.on('video-pause', async (data) => {
+    try {
+      if (!socket.roomId || !socket.userId) return;
+
+      const room = await Room.findById(socket.roomId);
+      if (!room || room.host.toString() !== socket.userId.toString()) return;
+
+      await room.updatePlaybackState({ isPlaying: false });
+      
+      socket.to(socket.roomId).emit('video-pause');
+    } catch (error) {
+      console.error('Video pause error:', error);
+    }
+  });
+
+  socket.on('video-seek', async (data) => {
+    try {
+      if (!socket.roomId || !socket.userId) return;
+
+      const room = await Room.findById(socket.roomId);
+      if (!room || room.host.toString() !== socket.userId.toString()) return;
+
+      await room.updatePlaybackState({ currentTime: data.time });
+      
+      socket.to(socket.roomId).emit('video-seek', { time: data.time });
+    } catch (error) {
+      console.error('Video seek error:', error);
+    }
+  });
+
+  // Video metadata
+  socket.on('video-metadata', async (data) => {
+    try {
+      if (!socket.roomId || !socket.userId) return;
+
+      const room = await Room.findById(socket.roomId);
+      if (!room || room.host.toString() !== socket.userId.toString()) return;
+
+      room.videoFile = {
+        name: data.name,
+        size: data.size,
+        type: data.type,
+        url: data.url
+      };
+      await room.save();
+
+      socket.to(socket.roomId).emit('video-metadata', {
+        name: data.name,
+        size: data.size,
+        type: data.type,
+        url: data.url
+      });
+    } catch (error) {
+      console.error('Video metadata error:', error);
+    }
+  });
+
+  // Chat messages
+  socket.on('chat-message', (data) => {
+    if (!socket.roomId || !socket.user) return;
+
+    socket.to(socket.roomId).emit('chat-message', {
+      user: socket.user,
+      message: data.message,
+      timestamp: new Date().toISOString()
+    });
   });
 
   // WebRTC signaling
@@ -256,69 +328,45 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Video control events
-  socket.on('video-play', (roomId) => {
-    const room = rooms.get(roomId);
-    if (room && room.host === socket.id) {
-      room.isPlaying = true;
-      socket.to(roomId).emit('video-play');
-    }
-  });
+  // Disconnect handling
+  socket.on('disconnect', async () => {
+    try {
+      console.log('User disconnected:', socket.id);
 
-  socket.on('video-pause', (roomId) => {
-    const room = rooms.get(roomId);
-    if (room && room.host === socket.id) {
-      room.isPlaying = false;
-      socket.to(roomId).emit('video-pause');
-    }
-  });
+      // Update user online status
+      if (socket.userId) {
+        await User.findByIdAndUpdate(socket.userId, {
+          isOnline: false,
+          lastSeen: new Date()
+        });
+      }
 
-  socket.on('video-seek', (data) => {
-    const room = rooms.get(data.roomId);
-    if (room && room.host === socket.id) {
-      room.currentTime = data.time;
-      socket.to(data.roomId).emit('video-seek', { time: data.time });
-    }
-  });
+      // Remove user from room
+      if (socket.roomId && socket.userId) {
+        const room = await Room.findById(socket.roomId);
+        if (room) {
+          await room.removeParticipant(socket.userId);
+          
+          // Notify other users
+          const updatedRoom = await Room.findById(socket.roomId)
+            .populate('participants.user', 'name picture');
 
-  // Video metadata for P2P streaming
-  socket.on('video-metadata', (data) => {
-    const room = rooms.get(data.roomId);
-    if (room && room.host === socket.id) {
-      room.videoFile = {
-        name: data.name,
-        size: data.size,
-        type: data.type
-      };
-      socket.to(data.roomId).emit('video-metadata', {
-        name: data.name,
-        size: data.size,
-        type: data.type
-      });
-    }
-  });
-
-  socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
-    
-    // Remove user from all rooms
-    for (const [roomId, room] of rooms.entries()) {
-      if (room.participants.includes(socket.id)) {
-        room.participants = room.participants.filter(id => id !== socket.id);
-        
-        if (room.host === socket.id && room.participants.length > 0) {
-          room.host = room.participants[0];
-        }
-        
-        if (room.participants.length === 0) {
-          rooms.delete(roomId);
-        } else {
-          io.to(roomId).emit('room-updated', {
-            participants: room.participants,
-            host: room.host
+          socket.to(socket.roomId).emit('user-left', {
+            user: socket.user,
+            participants: updatedRoom.participants.map(p => ({
+              user: {
+                id: p.user._id,
+                name: p.user.name,
+                picture: p.user.picture
+              },
+              isHost: p.isHost,
+              isActive: p.isActive
+            }))
           });
         }
       }
+    } catch (error) {
+      console.error('Disconnect error:', error);
     }
   });
 });
