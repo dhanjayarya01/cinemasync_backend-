@@ -1,0 +1,15 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+package-lock.json
+
+# Optional log files
+*.log
+
+# dotenv environment files
+.env
+.env.local
+.env.*.local
