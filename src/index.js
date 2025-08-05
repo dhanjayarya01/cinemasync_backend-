@@ -2,25 +2,138 @@ import express from 'express';
 import http from 'http';
 import { Server as socketIo } from 'socket.io';
 import cors from 'cors';
+import { OAuth2Client } from 'google-auth-library';
+import jwt from 'jsonwebtoken';
+import dotenv from 'dotenv';
 
-
+// Load environment variables
+dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
 
-
 const io = new socketIo(server, {
   cors: {
-    origin: "*", 
-    methods: ["GET", "POST"]
+    origin: process.env.FRONTEND_URL || "http://localhost:3000", 
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 
-
-
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  credentials: true
+}));
 app.use(express.json());
 
+// Initialize Google OAuth client
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// In-memory user storage (in production, use a database)
+const users = new Map();
+
+// Middleware to verify JWT token
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Google OAuth verification endpoint
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { credential } = req.body;
+    
+    if (!credential) {
+      return res.status(400).json({ error: 'Google credential is required' });
+    }
+
+    // Verify the Google ID token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID
+    });
+
+    const payload = ticket.getPayload();
+    const { sub: googleId, email, name, picture } = payload;
+
+    // Create or update user
+    let user = users.get(googleId);
+    if (!user) {
+      user = {
+        id: googleId,
+        email,
+        name,
+        picture,
+        createdAt: new Date().toISOString()
+      };
+      users.set(googleId, user);
+    } else {
+      // Update existing user info
+      user.name = name;
+      user.picture = picture;
+      user.email = email;
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        email: user.email, 
+        name: user.name 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        picture: user.picture
+      }
+    });
+
+  } catch (error) {
+    console.error('Google OAuth error:', error);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// Get user profile
+app.get('/api/auth/profile', authenticateToken, (req, res) => {
+  const user = users.get(req.user.id);
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  
+  res.json({
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    picture: user.picture
+  });
+});
+
+// Logout endpoint
+app.post('/api/auth/logout', authenticateToken, (req, res) => {
+  // In a real application, you might want to blacklist the token
+  res.json({ success: true, message: 'Logged out successfully' });
+});
 
 const rooms = new Map();
 
