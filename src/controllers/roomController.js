@@ -47,13 +47,7 @@ export const createRoom = async (req, res) => {
     });
 
     // Add host as first participant
-    room.participants.push({
-      user: req.user.id,
-      joinedAt: new Date(),
-      isHost: true,
-      isActive: true,
-      lastSeen: new Date()
-    });
+    await room.addParticipant(req.user.id, true);
 
     await room.save();
 
@@ -176,8 +170,11 @@ export const getRoom = async (req, res) => {
       });
     }
 
-    // Check if user can join
-    const canJoin = room.canUserJoin(req.user.id);
+    // Check if user can join (only if user is authenticated)
+    let canJoin = { canJoin: true };
+    if (req.user && req.user.id) {
+      canJoin = room.canUserJoin(req.user.id);
+    }
 
     res.json({
       success: true,

@@ -60,8 +60,6 @@ const userSchema = new mongoose.Schema({
 });
 
 // Index for better query performance
-userSchema.index({ googleId: 1 });
-userSchema.index({ email: 1 });
 userSchema.index({ isOnline: 1 });
 
 // Virtual for user's display name

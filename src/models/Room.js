@@ -185,13 +185,14 @@ roomSchema.virtual('hostInfo').get(function() {
 });
 
 // Method to add participant
-roomSchema.methods.addParticipant = async function(userId) {
+roomSchema.methods.addParticipant = async function(userId, isHost = false) {
   const existingParticipant = this.participants.find(p => p.user.toString() === userId.toString());
   
   if (!existingParticipant) {
     this.participants.push({
       user: userId,
       joinedAt: new Date(),
+      isHost: isHost,
       isActive: true,
       lastSeen: new Date()
     });
@@ -200,6 +201,10 @@ roomSchema.methods.addParticipant = async function(userId) {
   } else {
     existingParticipant.isActive = true;
     existingParticipant.lastSeen = new Date();
+    // Update isHost flag if needed
+    if (isHost) {
+      existingParticipant.isHost = true;
+    }
   }
   
   return this.save();

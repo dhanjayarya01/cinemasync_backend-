@@ -9,13 +9,13 @@ import {
   leaveRoom,
   getUserRooms
 } from '../controllers/roomController.js';
-import { authenticateToken, isRoomHost, isRoomParticipant } from '../middleware/auth.js';
+import { authenticateToken, optionalAuth, isRoomHost, isRoomParticipant } from '../middleware/auth.js';
 
 const router = express.Router();
 
 // Public routes (with optional auth)
 router.get('/', getRooms);
-router.get('/:roomId', getRoom);
+router.get('/:roomId', optionalAuth, getRoom);
 
 // Protected routes
 router.post('/', authenticateToken, createRoom);

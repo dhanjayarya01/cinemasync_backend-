@@ -64,9 +64,11 @@ io.on('connection', (socket) => {
       }
 
       // Verify token and get user
-      const jwt = require('jsonwebtoken');
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const jwt = await import('jsonwebtoken');
+      const decoded = jwt.default.verify(token, process.env.JWT_SECRET);
+      console.log('Token decoded:', decoded);
       const user = await User.findById(decoded.id);
+      console.log('User found:', user ? user.name : 'Not found');
 
       if (!user) {
         socket.emit('auth-error', { error: 'Invalid token' });
@@ -125,7 +127,7 @@ io.on('connection', (socket) => {
       socket.roomId = roomId;
 
       // Add user to room participants
-      await room.addParticipant(socket.userId);
+      await room.addParticipant(socket.userId, false);
 
       // Get updated room info
       const updatedRoom = await Room.findById(roomId)
