@@ -9,10 +9,10 @@ import roomRoutes from './routes/rooms.js';
 import Room from './models/Room.js';
 import User from './models/User.js';
 
-// Load environment variables
+
 dotenv.config();
 
-// Connect to database
+
 connectDB();
 
 const app = express();
@@ -36,20 +36,20 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/rooms', roomRoutes);
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    success: true, 
-    message: 'Server is running',
-    timestamp: new Date().toISOString()
-  });
-});
+// // Health check endpoint
+// app.get('/api/health', (req, res) => {
+//   res.json({ 
+//     success: true, 
+//     message: 'Server is running',
+//     timestamp: new Date().toISOString()
+//   });
+// });
 
-// Socket.io connection handling
+
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+  console.log('_on connection__User connected :', socket.id);
 
-  // Store user info in socket
+  
   socket.userId = null;
   socket.roomId = null;
 
@@ -97,91 +97,127 @@ io.on('connection', (socket) => {
   });
 
   // Join room
-  socket.on('join-room', async (data) => {
-    try {
-      const { roomId } = data;
-      
-      if (!socket.userId) {
-        socket.emit('error', { error: 'Not authenticated' });
-        return;
-      }
+socket.on('join-room', async (data) => {
+  try {
+    const { roomId } = data;
 
-      const room = await Room.findById(roomId)
-        .populate('host', 'name picture')
-        .populate('participants.user', 'name picture');
+    if (!socket.userId) {
+      socket.emit('error', { error: 'Not authenticated' });
+      return;
+    }
 
-      if (!room) {
-        socket.emit('error', { error: 'Room not found' });
-        return;
-      }
+    let room = await Room.findById(roomId)
+      .populate('host', 'name picture')
+      .populate('participants.user', 'name picture');
 
-      // Check if user can join
-      const canJoin = room.canUserJoin(socket.userId);
-      if (!canJoin.canJoin) {
-        socket.emit('error', { error: canJoin.reason });
-        return;
-      }
+    if (!room) {
+      socket.emit('error', { error: 'Room not found' });
+      return;
+    }
 
-      // Join socket room
-      socket.join(roomId);
-      socket.roomId = roomId;
+    // Check if user can join (custom room logic)
+    const canJoin = room.canUserJoin(socket.userId);
+    if (!canJoin.canJoin) {
+      socket.emit('error', { error: canJoin.reason });
+      return;
+    }
 
-      // Add user to room participants
-      await room.addParticipant(socket.userId, false);
+    // Join socket.io room
+    socket.join(roomId);
+    socket.roomId = roomId;
 
-      // Get updated room info
-      const updatedRoom = await Room.findById(roomId)
-        .populate('host', 'name picture')
-        .populate('participants.user', 'name picture');
-
-      // Send room info to the joining user
-      socket.emit('room-joined', {
-        room: {
-          id: updatedRoom._id,
-          name: updatedRoom.name,
-          host: {
-            id: updatedRoom.host._id,
-            name: updatedRoom.host.name,
-            picture: updatedRoom.host.picture
-          },
-          movie: updatedRoom.movie,
-          videoFile: updatedRoom.videoFile,
-          status: updatedRoom.status,
-          playbackState: updatedRoom.playbackState,
-          settings: updatedRoom.settings,
-          participants: updatedRoom.participants.map(p => ({
-            user: {
-              id: p.user._id,
-              name: p.user.name,
-              picture: p.user.picture
-            },
-            joinedAt: p.joinedAt,
-            isHost: p.isHost,
-            isActive: p.isActive
-          }))
+    // ✅ Prevent duplicates: Update or insert participant atomically
+    await Room.updateOne(
+      { _id: roomId, 'participants.user': { $ne: socket.userId } },
+      {
+        $addToSet: {
+          participants: {
+            user: socket.userId,
+            joinedAt: new Date(),
+            isHost: false,
+            isActive: true,
+            lastSeen: new Date()
+          }
         }
-      });
+      }
+    );
 
-      // Notify other users
-      socket.to(roomId).emit('user-joined', {
-        user: socket.user,
-        participants: updatedRoom.participants.map(p => ({
+    // ✅ If already in room, just update active status & timestamp
+    await Room.updateOne(
+      { _id: roomId, 'participants.user': socket.userId },
+      {
+        $set: {
+          'participants.$.isActive': true,
+          'participants.$.lastSeen': new Date()
+        }
+      }
+    );
+
+    // Get updated room info
+    room = await Room.findById(roomId)
+      .populate('host', 'name picture')
+      .populate('participants.user', 'name picture');
+
+    console.log(`User ${socket.user.name} joined room ${roomId}`);
+
+    // Send room info to the joining user
+    socket.emit('room-joined', {
+      room: {
+        id: room._id,
+        name: room.name,
+        host: {
+          id: room.host._id,
+          name: room.host.name,
+          picture: room.host.picture
+        },
+        movie: room.movie,
+        videoFile: room.videoFile,
+        status: room.status,
+        playbackState: room.playbackState,
+        settings: room.settings,
+        participants: room.participants.map(p => ({
           user: {
             id: p.user._id,
             name: p.user.name,
             picture: p.user.picture
           },
+          joinedAt: p.joinedAt,
           isHost: p.isHost,
           isActive: p.isActive
         }))
-      });
+      }
+    });
 
-      console.log(`User ${socket.user.name} joined room ${roomId}`);
-    } catch (error) {
-      console.error('Join room error:', error);
-      socket.emit('error', { error: 'Failed to join room' });
-    }
-  });
+    // Notify other users in the room
+    socket.to(roomId).emit('user-joined', {
+      user: socket.user,
+      userId: socket.userId,
+      participants: room.participants.map(p => ({
+        user: {
+          id: p.user._id,
+          name: p.user.name,
+          picture: p.user.picture
+        },
+        isHost: p.isHost,
+        isActive: p.isActive
+      }))
+    });
+
+    console.log(`[Socket.io] user-joined event emitted for userId: ${socket.userId}`);
+
+    // Notify WebRTC peers
+    socket.to(roomId).emit('peer-joined', {
+      peerId: socket.userId,
+      peerName: socket.user.name
+    });
+
+  } catch (error) {
+    console.error('Join room error:', error);
+    socket.emit('error', { error: 'Failed to join room' });
+  }
+});
+
+
 
   // Leave room
   socket.on('leave-room', async () => {
@@ -210,6 +246,12 @@ io.on('connection', (socket) => {
             isHost: p.isHost,
             isActive: p.isActive
           }))
+        });
+
+        // Notify for WebRTC connections
+        socket.to(socket.roomId).emit('peer-left', {
+          peerId: socket.userId,
+          peerName: socket.user?.name
         });
       }
 
@@ -300,34 +342,54 @@ io.on('connection', (socket) => {
   // Chat messages
   socket.on('chat-message', (data) => {
     if (!socket.roomId || !socket.user) return;
-
     socket.to(socket.roomId).emit('chat-message', {
+      ...data,
       user: socket.user,
-      message: data.message,
       timestamp: new Date().toISOString()
     });
   });
 
   // WebRTC signaling
   socket.on('offer', (data) => {
-    socket.to(data.to).emit('offer', {
-      offer: data.offer,
-      from: socket.id
-    });
+    // Find the target user's socket and send the offer
+    const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.userId === data.to);
+    if (targetSocket) {
+      targetSocket.emit('offer', {
+        offer: data.offer,
+        from: socket.userId
+      });
+      console.log(`WebRTC offer sent from ${socket.userId} to ${data.to}`);
+    } else {
+      console.log(`Target user ${data.to} not found for WebRTC offer`);
+    }
   });
 
   socket.on('answer', (data) => {
-    socket.to(data.to).emit('answer', {
-      answer: data.answer,
-      from: socket.id
-    });
+    // Find the target user's socket and send the answer
+    const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.userId === data.to);
+    if (targetSocket) {
+      targetSocket.emit('answer', {
+        answer: data.answer,
+        from: socket.userId
+      });
+      console.log(`WebRTC answer sent from ${socket.userId} to ${data.to}`);
+    } else {
+      console.log(`Target user ${data.to} not found for WebRTC answer`);
+    }
   });
 
   socket.on('ice-candidate', (data) => {
-    socket.to(data.to).emit('ice-candidate', {
-      candidate: data.candidate,
-      from: socket.id
-    });
+    // Find the target user's socket and send the ICE candidate
+    const targetSocket = Array.from(io.sockets.sockets.values()).find(s => s.userId === data.to);
+    if (targetSocket) {
+      targetSocket.emit('ice-candidate', {
+        candidate: data.candidate,
+        from: socket.userId
+      });
+      console.log(`WebRTC ICE candidate sent from ${socket.userId} to ${data.to}`);
+    } else {
+      console.log(`Target user ${data.to} not found for WebRTC ICE candidate`);
+    }
   });
 
   // Disconnect handling
@@ -364,6 +426,12 @@ io.on('connection', (socket) => {
               isHost: p.isHost,
               isActive: p.isActive
             }))
+          });
+
+          // Notify for WebRTC connections
+          socket.to(socket.roomId).emit('peer-left', {
+            peerId: socket.userId,
+            peerName: socket.user?.name
           });
         }
       }

@@ -186,29 +186,33 @@ roomSchema.virtual('hostInfo').get(function() {
 
 // Method to add participant
 roomSchema.methods.addParticipant = async function(userId, isHost = false) {
-  const existingParticipant = this.participants.find(p => p.user.toString() === userId.toString());
-  
+  const existingParticipant = this.participants.find(
+    p => p.user.toString() === userId.toString()
+  );
+
   if (!existingParticipant) {
     this.participants.push({
       user: userId,
       joinedAt: new Date(),
-      isHost: isHost,
+      isHost,
       isActive: true,
       lastSeen: new Date()
     });
-    this.currentParticipants = this.participants.filter(p => p.isActive).length;
-    this.stats.peakParticipants = Math.max(this.stats.peakParticipants, this.currentParticipants);
   } else {
+    // Just update info
     existingParticipant.isActive = true;
     existingParticipant.lastSeen = new Date();
-    // Update isHost flag if needed
-    if (isHost) {
-      existingParticipant.isHost = true;
-    }
+    if (isHost) existingParticipant.isHost = true;
   }
-  
+
+  // Update counters
+  this.currentParticipants = this.participants.filter(p => p.isActive).length;
+  this.stats.peakParticipants = Math.max(this.stats.peakParticipants, this.currentParticipants);
+
   return this.save();
 };
+
+
 
 // Method to remove participant
 roomSchema.methods.removeParticipant = async function(userId) {
