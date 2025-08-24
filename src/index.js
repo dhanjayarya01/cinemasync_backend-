@@ -295,6 +295,79 @@ io.on('connection', (socket) => {
     });
   });
 
+  // Voice messages
+  socket.on('voice-message', (data, callback) => {
+    if (!socket.roomId || !socket.user) {
+      if (callback) callback({ success: false, error: 'Not in room' });
+      return;
+    }
+    
+    try {
+      console.log('Voice message received from:', socket.user.name);
+      socket.to(socket.roomId).emit('voice-message', {
+        message: {
+          ...data.message,
+          user: socket.user,
+          timestamp: new Date().toISOString(),
+        }
+      });
+      
+      // Send acknowledgment back to sender
+      if (callback) callback({ success: true, message: 'Voice message sent' });
+    } catch (error) {
+      console.error('Error handling voice message:', error);
+      if (callback) callback({ success: false, error: error.message });
+    }
+  });
+
+  // Video state sync request
+  socket.on('video-state-request', (data) => {
+    if (!socket.roomId || !socket.user) return;
+    console.log('Video state request from:', socket.user.name);
+    
+    // Find the host in the room and ask them to send video state
+    socket.to(socket.roomId).emit('video-state-request', {
+      from: socket.user.id,
+      roomId: socket.roomId
+    });
+  });
+
+  // Host video state request handler
+  socket.on('host-video-state-request', (data) => {
+    if (!socket.roomId || !socket.user) return;
+    
+    // Check if this user is the host
+    const room = io.sockets.adapter.rooms.get(socket.roomId);
+    if (room) {
+      const hostSocket = Array.from(room).find(sid => {
+        const s = io.sockets.sockets.get(sid);
+        return s && s.user && s.user.id === socket.user.id;
+      });
+      
+      if (hostSocket) {
+        console.log('Host video state request from:', socket.user.name);
+        // Broadcast to all other users in the room
+        socket.to(socket.roomId).emit('host-video-state-request', {
+          from: socket.user.id,
+          roomId: socket.roomId
+        });
+      }
+    }
+  });
+
+  // Video state sync response
+  socket.on('video-state-sync', (data) => {
+    if (!socket.roomId || !socket.user) return;
+    console.log('Video state sync from host:', socket.user.name);
+    
+    // Broadcast video state to all other users in the room
+    socket.to(socket.roomId).emit('video-state-sync', {
+      videoState: data.videoState,
+      from: socket.user.id,
+      roomId: socket.roomId
+    });
+  });
+
   /**
    * =============================
    * WebRTC signaling (userId -> socket.id mapping)
