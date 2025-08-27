@@ -1,3 +1,4 @@
+
 import express from 'express';
 import http from 'http';
 import { Server as socketIo } from 'socket.io';
@@ -26,25 +27,16 @@ const io = new socketIo(server, {
 
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    origin: "*",
     credentials: true,
   })
 );
 app.use(express.json());
 
-// Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/rooms', roomRoutes);
 
-/**
- * =============================
- * Socket helpers: user <-> sockets
- * =============================
- * Many apps try to route signaling by userId. That works only if you map
- * userId -> socket.id for the CURRENT connection(s). Users may have multiple
- * tabs (multiple sockets). We keep a Set of socket IDs per user.
- */
-const userSockets = new Map(); // Map<userId:string, Set<socketId:string>>
+const userSockets = new Map();
 
 function addUserSocket(userId, socketId) {
   const set = userSockets.get(userId) || new Set();
@@ -63,9 +55,6 @@ function getUserSocketIds(userId) {
   return userSockets.get(userId) || new Set();
 }
 
-/**
- * Optional: restrict signaling to same room to avoid cross-room leaks
- */
 function emitToUserInSameRoom(userId, roomId, event, payload) {
   const targetSocketIds = Array.from(getUserSocketIds(userId));
   if (targetSocketIds.length === 0) return 0;
@@ -81,61 +70,40 @@ function emitToUserInSameRoom(userId, roomId, event, payload) {
 }
 
 io.on('connection', (socket) => {
-  console.log('_on connection__User connected :', socket.id);
-
   socket.userId = null;
   socket.user = null;
   socket.roomId = null;
 
-  // Authenticate socket connection
   socket.on('authenticate', async (data) => {
     try {
       const { token } = data || {};
       if (!token) return socket.emit('auth-error', { error: 'Token required' });
-
       const jwt = await import('jsonwebtoken');
       const decoded = jwt.default.verify(token, process.env.JWT_SECRET);
-      console.log('Token decoded:', decoded);
-
       const user = await User.findById(decoded.id);
-      console.log('User found:', user ? user.name : 'Not found');
       if (!user) return socket.emit('auth-error', { error: 'Invalid token' });
-
       socket.userId = user._id.toString();
       socket.user = { id: user._id, name: user.name, picture: user.picture };
-
-      // Map user to this socket
       addUserSocket(socket.userId, socket.id);
-
       await user.updateOnlineStatus(true);
-
       socket.emit('authenticated', { user: socket.user });
-      console.log(`User ${user.name} authenticated: ${socket.id}`);
     } catch (error) {
-      console.error('Socket authentication error:', error);
       socket.emit('auth-error', { error: 'Authentication failed' });
     }
   });
 
-  // Join room
   socket.on('join-room', async (data) => {
     try {
       const { roomId } = data || {};
       if (!socket.userId) return socket.emit('error', { error: 'Not authenticated' });
-
       let room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
-
       if (!room) return socket.emit('error', { error: 'Room not found' });
-
       const canJoin = room.canUserJoin(socket.userId);
       if (!canJoin.canJoin) return socket.emit('error', { error: canJoin.reason });
-
       socket.join(roomId);
       socket.roomId = roomId;
-
-      // Avoid dup participants, but mark active
       await Room.updateOne(
         { _id: roomId, 'participants.user': { $ne: socket.userId } },
         {
@@ -150,19 +118,13 @@ io.on('connection', (socket) => {
           },
         }
       );
-
       await Room.updateOne(
         { _id: roomId, 'participants.user': socket.userId },
         { $set: { 'participants.$.isActive': true, 'participants.$.lastSeen': new Date() } }
       );
-
       room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
-
-      console.log(`User ${socket.user.name} joined room ${roomId}`);
-
-      // Send room info to the joining user
       socket.emit('room-joined', {
         room: {
           id: room._id,
@@ -181,8 +143,6 @@ io.on('connection', (socket) => {
           })),
         },
       });
-
-      // Notify other users in the room
       socket.to(roomId).emit('user-joined', {
         user: socket.user,
         userId: socket.userId,
@@ -192,25 +152,19 @@ io.on('connection', (socket) => {
           isActive: p.isActive,
         })),
       });
-
-      // Notify for WebRTC peers
       socket.to(roomId).emit('peer-joined', { peerId: socket.userId, peerName: socket.user.name });
     } catch (error) {
-      console.error('Join room error:', error);
       socket.emit('error', { error: 'Failed to join room' });
     }
   });
 
-  // Leave room
   socket.on('leave-room', async () => {
     try {
       if (!socket.roomId || !socket.userId) return;
-
       const room = await Room.findById(socket.roomId);
       if (room) {
         await room.removeParticipant(socket.userId);
         const updatedRoom = await Room.findById(socket.roomId).populate('participants.user', 'name picture');
-
         socket.to(socket.roomId).emit('user-left', {
           user: socket.user,
           participants: updatedRoom.participants.map((p) => ({
@@ -219,33 +173,27 @@ io.on('connection', (socket) => {
             isActive: p.isActive,
           })),
         });
-
         socket.to(socket.roomId).emit('peer-left', { peerId: socket.userId, peerName: socket.user?.name });
       }
-
       socket.leave(socket.roomId);
       socket.roomId = null;
-
-      console.log(`User ${socket.user?.name} left room`);
     } catch (error) {
-      console.error('Leave room error:', error);
     }
   });
 
-  // Video control events (host only)
-  socket.on('video-play', async () => {
+  socket.on('video-play', async (data) => {
     try {
       if (!socket.roomId || !socket.userId) return;
       const room = await Room.findById(socket.roomId);
       if (!room || room.host.toString() !== socket.userId.toString()) return;
-      await room.updatePlaybackState({ isPlaying: true });
-      socket.to(socket.roomId).emit('video-play', { currentTime: room.playbackState.currentTime });
+      const currentTime = (data && typeof data.currentTime === 'number') ? data.currentTime : room.playbackState?.currentTime || 0;
+      await room.updatePlaybackState({ isPlaying: true, currentTime });
+      socket.to(socket.roomId).emit('video-play', { currentTime });
     } catch (error) {
-      console.error('Video play error:', error);
     }
   });
 
-  socket.on('video-pause', async () => {
+  socket.on('video-pause', async (data) => {
     try {
       if (!socket.roomId || !socket.userId) return;
       const room = await Room.findById(socket.roomId);
@@ -253,7 +201,6 @@ io.on('connection', (socket) => {
       await room.updatePlaybackState({ isPlaying: false });
       socket.to(socket.roomId).emit('video-pause');
     } catch (error) {
-      console.error('Video pause error:', error);
     }
   });
 
@@ -262,30 +209,25 @@ io.on('connection', (socket) => {
       if (!socket.roomId || !socket.userId) return;
       const room = await Room.findById(socket.roomId);
       if (!room || room.host.toString() !== socket.userId.toString()) return;
-      await room.updatePlaybackState({ currentTime: data.time });
-      socket.to(socket.roomId).emit('video-seek', { time: data.time });
+      const time = data && typeof data.time === 'number' ? data.time : 0;
+      await room.updatePlaybackState({ currentTime: time });
+      socket.to(socket.roomId).emit('video-seek', { time });
     } catch (error) {
-      console.error('Video seek error:', error);
     }
   });
 
-  // Video metadata (host only)
   socket.on('video-metadata', async (data) => {
     try {
       if (!socket.roomId || !socket.userId) return;
       const room = await Room.findById(socket.roomId);
       if (!room || room.host.toString() !== socket.userId.toString()) return;
-
       room.videoFile = { name: data.name, size: data.size, type: data.type, url: data.url };
       await room.save();
-
       socket.to(socket.roomId).emit('video-metadata', { name: data.name, size: data.size, type: data.type, url: data.url });
     } catch (error) {
-      console.error('Video metadata error:', error);
     }
   });
 
-  // Chat messages
   socket.on('chat-message', (data) => {
     if (!socket.roomId || !socket.user) return;
     socket.to(socket.roomId).emit('chat-message', {
@@ -295,15 +237,12 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Voice messages
   socket.on('voice-message', (data, callback) => {
     if (!socket.roomId || !socket.user) {
       if (callback) callback({ success: false, error: 'Not in room' });
       return;
     }
-    
     try {
-      console.log('Voice message received from:', socket.user.name);
       socket.to(socket.roomId).emit('voice-message', {
         message: {
           ...data.message,
@@ -311,70 +250,61 @@ io.on('connection', (socket) => {
           timestamp: new Date().toISOString(),
         }
       });
-      
-      // Send acknowledgment back to sender
       if (callback) callback({ success: true, message: 'Voice message sent' });
     } catch (error) {
-      console.error('Error handling voice message:', error);
       if (callback) callback({ success: false, error: error.message });
     }
   });
 
-  // Video state sync request
+  // NEW: Live voice streaming handler
+  socket.on('live-voice-stream', (data) => {
+    if (!socket.roomId || !socket.user) return;
+    
+    try {
+      // Relay live voice stream to all other participants in the room
+      socket.to(socket.roomId).emit('live-voice-stream', {
+        audioData: data.audioData,
+        userId: socket.user.id,
+        userName: socket.user.name,
+        timestamp: data.timestamp || Date.now()
+      });
+    } catch (error) {
+      console.error('Live voice stream error:', error);
+    }
+  });
+
   socket.on('video-state-request', (data) => {
     if (!socket.roomId || !socket.user) return;
-    console.log('Video state request from:', socket.user.name);
-    
-    // Find the host in the room and ask them to send video state
     socket.to(socket.roomId).emit('video-state-request', {
       from: socket.user.id,
       roomId: socket.roomId
     });
   });
 
-  // Host video state request handler
-  socket.on('host-video-state-request', (data) => {
-    if (!socket.roomId || !socket.user) return;
-    
-    // Check if this user is the host
-    const room = io.sockets.adapter.rooms.get(socket.roomId);
-    if (room) {
-      const hostSocket = Array.from(room).find(sid => {
-        const s = io.sockets.sockets.get(sid);
-        return s && s.user && s.user.id === socket.user.id;
-      });
-      
-      if (hostSocket) {
-        console.log('Host video state request from:', socket.user.name);
-        // Broadcast to all other users in the room
+  socket.on('host-video-state-request', async (data) => {
+    try {
+      if (!socket.roomId || !socket.userId) return;
+      const roomDoc = await Room.findById(socket.roomId);
+      if (!roomDoc) return;
+      if (roomDoc.host && roomDoc.host.toString() === socket.userId) {
         socket.to(socket.roomId).emit('host-video-state-request', {
-          from: socket.user.id,
+          from: socket.userId,
           roomId: socket.roomId
         });
       }
+    } catch (err) {
     }
   });
 
-  // Video state sync response
   socket.on('video-state-sync', (data) => {
     if (!socket.roomId || !socket.user) return;
-    console.log('Video state sync from host:', socket.user.name);
-    
-    // Broadcast video state to all other users in the room
     socket.to(socket.roomId).emit('video-state-sync', {
-      videoState: data.videoState,
+      videoState: data.videoState || data,
       from: socket.user.id,
       roomId: socket.roomId
     });
   });
 
-  /**
-   * =============================
-   * WebRTC signaling (userId -> socket.id mapping)
-   * =============================
-   * We accept { to: <targetUserId>, offer/answer/candidate } and deliver to
-   * the current socket(s) of that user that are in the SAME room.
-   */
   socket.on('offer', (data) => {
     if (!socket.userId || !socket.roomId) return;
     const delivered = emitToUserInSameRoom(data.to, socket.roomId, 'offer', {
@@ -382,9 +312,6 @@ io.on('connection', (socket) => {
       from: socket.userId,
     });
     if (delivered === 0) {
-      console.log(`Target user ${data.to} not found for WebRTC offer (same room required).`);
-    } else {
-      console.log(`WebRTC offer sent from ${socket.userId} to ${data.to} (x${delivered}).`);
     }
   });
 
@@ -395,9 +322,6 @@ io.on('connection', (socket) => {
       from: socket.userId,
     });
     if (delivered === 0) {
-      console.log(`Target user ${data.to} not found for WebRTC answer (same room required).`);
-    } else {
-      console.log(`WebRTC answer sent from ${socket.userId} to ${data.to} (x${delivered}).`);
     }
   });
 
@@ -408,28 +332,23 @@ io.on('connection', (socket) => {
       from: socket.userId,
     });
     if (delivered === 0) {
-      console.log(`Target user ${data.to} not found for WebRTC ICE candidate (same room required).`);
-    } else {
-      console.log(`WebRTC ICE candidate sent from ${socket.userId} to ${data.to} (x${delivered}).`);
     }
   });
 
-  // Disconnect handling
   socket.on('disconnect', async () => {
     try {
-      console.log('User disconnected:', socket.id);
-
       if (socket.userId) {
         removeUserSocket(socket.userId, socket.id);
-        await User.findByIdAndUpdate(socket.userId, { isOnline: false, lastSeen: new Date() });
+        const remaining = getUserSocketIds(socket.userId);
+        if (!remaining || remaining.size === 0) {
+          await User.findByIdAndUpdate(socket.userId, { isOnline: false, lastSeen: new Date() });
+        }
       }
-
       if (socket.roomId && socket.userId) {
         const room = await Room.findById(socket.roomId);
         if (room) {
           await room.removeParticipant(socket.userId);
           const updatedRoom = await Room.findById(socket.roomId).populate('participants.user', 'name picture');
-
           socket.to(socket.roomId).emit('user-left', {
             user: socket.user,
             participants: updatedRoom.participants.map((p) => ({
@@ -438,12 +357,10 @@ io.on('connection', (socket) => {
               isActive: p.isActive,
             })),
           });
-
           socket.to(socket.roomId).emit('peer-left', { peerId: socket.userId, peerName: socket.user?.name });
         }
       }
     } catch (error) {
-      console.error('Disconnect error:', error);
     }
   });
 });
