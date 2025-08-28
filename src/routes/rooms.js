@@ -14,7 +14,7 @@ import { authenticateToken, optionalAuth, isRoomHost, isRoomParticipant } from '
 const router = express.Router();
 
 // Public routes (with optional auth)
-router.get('/', getRooms);
+router.get('/', optionalAuth, getRooms);
 router.get('/:roomId', optionalAuth, getRoom);
 
 // Protected routes

@@ -70,38 +70,61 @@ function emitToUserInSameRoom(userId, roomId, event, payload) {
 }
 
 io.on('connection', (socket) => {
+  console.log('[DEBUG] New socket connection:', socket.id);
   socket.userId = null;
   socket.user = null;
   socket.roomId = null;
 
   socket.on('authenticate', async (data) => {
     try {
+      console.log('[DEBUG] Authentication request received:', { hasToken: !!(data?.token), socketId: socket.id });
       const { token } = data || {};
-      if (!token) return socket.emit('auth-error', { error: 'Token required' });
+      if (!token) {
+        console.log('[DEBUG] Authentication failed: No token provided');
+        return socket.emit('auth-error', { error: 'Token required' });
+      }
       const jwt = await import('jsonwebtoken');
       const decoded = jwt.default.verify(token, process.env.JWT_SECRET);
       const user = await User.findById(decoded.id);
-      if (!user) return socket.emit('auth-error', { error: 'Invalid token' });
+      if (!user) {
+        console.log('[DEBUG] Authentication failed: User not found');
+        return socket.emit('auth-error', { error: 'Invalid token' });
+      }
       socket.userId = user._id.toString();
       socket.user = { id: user._id, name: user.name, picture: user.picture };
       addUserSocket(socket.userId, socket.id);
       await user.updateOnlineStatus(true);
+      console.log('[DEBUG] Authentication successful:', { userId: socket.userId, userName: user.name });
       socket.emit('authenticated', { user: socket.user });
     } catch (error) {
+      console.log('[DEBUG] Authentication error:', error.message);
       socket.emit('auth-error', { error: 'Authentication failed' });
     }
   });
 
   socket.on('join-room', async (data) => {
     try {
+      console.log('[DEBUG] Join room request:', { roomId: data?.roomId, userId: socket.userId, socketId: socket.id });
       const { roomId } = data || {};
-      if (!socket.userId) return socket.emit('error', { error: 'Not authenticated' });
+      if (!socket.userId) {
+        console.log('[DEBUG] Join room failed: Not authenticated');
+        return socket.emit('error', { error: 'Not authenticated' });
+      }
       let room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
-      if (!room) return socket.emit('error', { error: 'Room not found' });
+      if (!room) {
+        console.log('[DEBUG] Join room failed: Room not found', roomId);
+        return socket.emit('error', { error: 'Room not found' });
+      }
+      console.log('[DEBUG] Room found:', { roomId, isPrivate: room.isPrivate, hostId: room.host._id });
       const canJoin = room.canUserJoin(socket.userId);
-      if (!canJoin.canJoin) return socket.emit('error', { error: canJoin.reason });
+      console.log('[DEBUG] Can join check:', canJoin);
+      if (!canJoin.canJoin) {
+        console.log('[DEBUG] Join room failed: Cannot join -', canJoin.reason);
+        return socket.emit('error', { error: canJoin.reason });
+      }
+      console.log('[DEBUG] Joining socket room and updating database...');
       socket.join(roomId);
       socket.roomId = roomId;
       await Room.updateOne(
@@ -125,6 +148,7 @@ io.on('connection', (socket) => {
       room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
+      console.log('[DEBUG] Emitting room-joined event...');
       socket.emit('room-joined', {
         room: {
           id: room._id,
@@ -154,6 +178,7 @@ io.on('connection', (socket) => {
       });
       socket.to(roomId).emit('peer-joined', { peerId: socket.userId, peerName: socket.user.name });
     } catch (error) {
+      console.error('[DEBUG] Join room error:', error);
       socket.emit('error', { error: 'Failed to join room' });
     }
   });

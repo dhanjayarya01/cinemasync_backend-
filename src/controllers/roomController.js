@@ -1,7 +1,6 @@
 import Room from '../models/Room.js';
 import User from '../models/User.js';
 
-// Create a new room
 export const createRoom = async (req, res) => {
   try {
     const {
@@ -13,13 +12,11 @@ export const createRoom = async (req, res) => {
       movieDuration,
       movieGenre,
       isPrivate,
-      password,
       maxParticipants,
       tags,
       settings
     } = req.body;
 
-    // Validate required fields
     if (!name || !movieName) {
       return res.status(400).json({
         success: false,
@@ -27,7 +24,6 @@ export const createRoom = async (req, res) => {
       });
     }
 
-    // Create room
     const room = new Room({
       name,
       description,
@@ -39,24 +35,19 @@ export const createRoom = async (req, res) => {
         duration: movieDuration,
         genre: movieGenre
       },
-      isPrivate,
-      password,
+      isPrivate: isPrivate || false,
       maxParticipants: maxParticipants || 50,
       tags: tags || [],
       settings: settings || {}
     });
 
-    // Add host as first participant
     await room.addParticipant(req.user.id, true);
-
     await room.save();
 
-    // Update user stats
     await User.findByIdAndUpdate(req.user.id, {
       $inc: { 'stats.roomsCreated': 1 }
     });
 
-    // Populate host info
     await room.populate('host', 'name picture');
 
     res.status(201).json({
@@ -90,24 +81,38 @@ export const createRoom = async (req, res) => {
   }
 };
 
-// Get all public rooms
 export const getRooms = async (req, res) => {
   try {
     const { page = 1, limit = 20, search, status } = req.query;
     const skip = (page - 1) * limit;
 
-    let query = { isPrivate: false };
+    let baseQuery = {
+      $or: [
+        { isPrivate: false },
+        ...(req.user ? [{ host: req.user._id, isPrivate: true }] : [])
+      ]
+    };
+
+    let query = baseQuery;
     
     if (status) {
-      query.status = status;
+      query = { $and: [baseQuery, { status }] };
     }
 
     if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { 'movie.name': { $regex: search, $options: 'i' } },
-        { tags: { $in: [new RegExp(search, 'i')] } }
-      ];
+      const searchConditions = {
+        $or: [
+          { name: { $regex: search, $options: 'i' } },
+          { 'movie.name': { $regex: search, $options: 'i' } },
+          { tags: { $in: [new RegExp(search, 'i')] } }
+        ]
+      };
+      
+      if (status) {
+        query = { $and: [baseQuery, { status }, searchConditions] };
+      } else {
+        query = { $and: [baseQuery, searchConditions] };
+      }
     }
 
     const rooms = await Room.find(query)
@@ -154,7 +159,6 @@ export const getRooms = async (req, res) => {
   }
 };
 
-// Get room by ID
 export const getRoom = async (req, res) => {
   try {
     const { roomId } = req.params;
@@ -170,7 +174,6 @@ export const getRoom = async (req, res) => {
       });
     }
 
-    // Check if user can join (only if user is authenticated)
     let canJoin = { canJoin: true };
     if (req.user && req.user.id) {
       canJoin = room.canUserJoin(req.user.id);
@@ -221,7 +224,6 @@ export const getRoom = async (req, res) => {
   }
 };
 
-// Update room
 export const updateRoom = async (req, res) => {
   try {
     const { roomId } = req.params;
@@ -236,15 +238,12 @@ export const updateRoom = async (req, res) => {
       });
     }
 
-    // Check if user is the host
     if (room.host.toString() !== req.user.id) {
       return res.status(403).json({
         success: false,
         error: 'Only the host can update the room'
       });
     }
-
-    // Update room
     const updatedRoom = await Room.findByIdAndUpdate(
       roomId,
       updateData,
@@ -281,7 +280,6 @@ export const updateRoom = async (req, res) => {
   }
 };
 
-// Delete room
 export const deleteRoom = async (req, res) => {
   try {
     const { roomId } = req.params;
@@ -295,7 +293,6 @@ export const deleteRoom = async (req, res) => {
       });
     }
 
-    // Check if user is the host
     if (room.host.toString() !== req.user.id) {
       return res.status(403).json({
         success: false,
@@ -319,11 +316,9 @@ export const deleteRoom = async (req, res) => {
   }
 };
 
-// Join room
 export const joinRoom = async (req, res) => {
   try {
     const { roomId } = req.params;
-    const { password } = req.body;
 
     const room = await Room.findById(roomId)
       .populate('host', 'name picture');
@@ -335,15 +330,6 @@ export const joinRoom = async (req, res) => {
       });
     }
 
-    // Check if room is private and password is required
-    if (room.isPrivate && room.password && room.password !== password) {
-      return res.status(403).json({
-        success: false,
-        error: 'Invalid password'
-      });
-    }
-
-    // Check if user can join
     const canJoin = room.canUserJoin(req.user.id);
     if (!canJoin.canJoin) {
       return res.status(403).json({
@@ -352,10 +338,7 @@ export const joinRoom = async (req, res) => {
       });
     }
 
-    // Add user to room
     await room.addParticipant(req.user.id);
-
-    // Update user stats
     await User.findByIdAndUpdate(req.user.id, {
       $inc: { 'stats.roomsJoined': 1 }
     });
@@ -385,7 +368,6 @@ export const joinRoom = async (req, res) => {
   }
 };
 
-// Leave room
 export const leaveRoom = async (req, res) => {
   try {
     const { roomId } = req.params;
@@ -399,7 +381,6 @@ export const leaveRoom = async (req, res) => {
       });
     }
 
-    // Remove user from room
     await room.removeParticipant(req.user.id);
 
     res.json({
@@ -416,15 +397,14 @@ export const leaveRoom = async (req, res) => {
   }
 };
 
-// Get user's rooms
 export const getUserRooms = async (req, res) => {
   try {
     const rooms = await Room.find({
       'participants.user': req.user.id,
       'participants.isActive': true
     })
-    .populate('host', 'name picture')
-    .sort({ updatedAt: -1 });
+      .populate('host', 'name picture')
+      .sort({ updatedAt: -1 });
 
     res.json({
       success: true,

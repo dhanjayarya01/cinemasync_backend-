@@ -63,10 +63,6 @@ const roomSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
-  password: {
-    type: String,
-    default: null
-  },
   maxParticipants: {
     type: Number,
     default: 50,
@@ -171,12 +167,12 @@ roomSchema.index({ createdAt: -1 });
 roomSchema.index({ tags: 1 });
 
 // Virtual for room URL
-roomSchema.virtual('roomUrl').get(function() {
+roomSchema.virtual('roomUrl').get(function () {
   return `/theater/${this._id}`;
 });
 
 // Virtual for host info
-roomSchema.virtual('hostInfo').get(function() {
+roomSchema.virtual('hostInfo').get(function () {
   return {
     id: this.host._id,
     name: this.host.name,
@@ -185,7 +181,7 @@ roomSchema.virtual('hostInfo').get(function() {
 });
 
 // Method to add participant
-roomSchema.methods.addParticipant = async function(userId, isHost = false) {
+roomSchema.methods.addParticipant = async function (userId, isHost = false) {
   const existingParticipant = this.participants.find(
     p => p.user.toString() === userId.toString()
   );
@@ -215,7 +211,7 @@ roomSchema.methods.addParticipant = async function(userId, isHost = false) {
 
 
 // Method to remove participant
-roomSchema.methods.removeParticipant = async function(userId) {
+roomSchema.methods.removeParticipant = async function (userId) {
   const participant = this.participants.find(p => p.user.toString() === userId.toString());
   if (participant) {
     participant.isActive = false;
@@ -226,35 +222,31 @@ roomSchema.methods.removeParticipant = async function(userId) {
 };
 
 // Method to update playback state
-roomSchema.methods.updatePlaybackState = async function(playbackData) {
+roomSchema.methods.updatePlaybackState = async function (playbackData) {
   this.playbackState = {
     ...this.playbackState,
     ...playbackData,
     lastUpdated: new Date()
   };
-  
+
   if (playbackData.isPlaying !== undefined) {
     this.status = playbackData.isPlaying ? 'playing' : 'paused';
   }
-  
+
   return this.save();
 };
 
 // Method to check if user can join
-roomSchema.methods.canUserJoin = function(userId) {
+roomSchema.methods.canUserJoin = function (userId) {
   if (this.currentParticipants >= this.maxParticipants) {
     return { canJoin: false, reason: 'Room is full' };
   }
-  
-  if (this.isPrivate && !this.participants.find(p => p.user.toString() === userId.toString())) {
-    return { canJoin: false, reason: 'Private room' };
-  }
-  
+
   return { canJoin: true };
 };
 
 // Static method to get public rooms
-roomSchema.statics.getPublicRooms = function(limit = 20, skip = 0) {
+roomSchema.statics.getPublicRooms = function (limit = 20, skip = 0) {
   return this.find({ isPrivate: false })
     .populate('host', 'name picture')
     .sort({ createdAt: -1 })
@@ -263,7 +255,7 @@ roomSchema.statics.getPublicRooms = function(limit = 20, skip = 0) {
 };
 
 // Static method to search rooms
-roomSchema.statics.searchRooms = function(query, limit = 20) {
+roomSchema.statics.searchRooms = function (query, limit = 20) {
   return this.find({
     $or: [
       { name: { $regex: query, $options: 'i' } },
@@ -272,9 +264,9 @@ roomSchema.statics.searchRooms = function(query, limit = 20) {
     ],
     isPrivate: false
   })
-  .populate('host', 'name picture')
-  .sort({ createdAt: -1 })
-  .limit(limit);
+    .populate('host', 'name picture')
+    .sort({ createdAt: -1 })
+    .limit(limit);
 };
 
 const Room = mongoose.model('Room', roomSchema);
