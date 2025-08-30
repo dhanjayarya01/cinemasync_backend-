@@ -135,7 +135,7 @@ io.on('connection', (socket) => {
       const existingParticipant = room.participants.find(p => p.user._id.toString() === socket.userId);
       
       if (!existingParticipant) {
-        // Add new participant
+        // Add new participant atomically
         await Room.updateOne(
           { _id: roomId },
           {
@@ -147,8 +147,7 @@ io.on('connection', (socket) => {
                 isActive: true,
                 lastSeen: new Date(),
               },
-            },
-            $inc: { currentParticipants: 1 }
+            }
           }
         );
       } else {
@@ -164,13 +163,14 @@ io.on('connection', (socket) => {
         );
       }
       
-      // Get updated room data
+      // Get updated room data and recalculate participants count
       room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
       
-      // Update current participants count
       const activeParticipants = room.participants.filter(p => p.isActive);
+      
+      // Update current participants count atomically
       await Room.updateOne(
         { _id: roomId },
         { $set: { currentParticipants: activeParticipants.length } }
@@ -195,21 +195,28 @@ io.on('connection', (socket) => {
         })),
       };
       
-      // Send to joining user
+      // Send to joining user first
       socket.emit('room-joined', { room: roomData });
       
-      // Broadcast to all users in room (including the one who just joined)
+      // Immediate broadcast to all users in room with updated participant count
       io.to(roomId).emit('participants-updated', {
         participants: roomData.participants,
-        currentParticipants: activeParticipants.length
+        currentParticipants: activeParticipants.length,
+        roomId: roomId
       });
       
-      // Notify others about new user
+      // Notify others about new user with complete room data
       socket.to(roomId).emit('user-joined', {
         user: socket.user,
         userId: socket.userId,
         participants: roomData.participants,
+        currentParticipants: activeParticipants.length
       });
+      
+      // Force room sync to all clients after join
+      setTimeout(() => {
+        io.to(roomId).emit('room-sync', { room: roomData });
+      }, 200);
       
       // WebRTC peer notification with delay to ensure socket room is ready
       setTimeout(() => {
@@ -396,6 +403,157 @@ io.on('connection', (socket) => {
       from: socket.userId,
     });
     if (delivered === 0) {
+    }
+  });
+
+  // Handle room sync requests
+  socket.on('request-room-sync', async (data) => {
+    try {
+      const { roomId } = data || {};
+      if (!socket.userId || !roomId) return;
+      
+      const room = await Room.findById(roomId)
+        .populate('host', 'name picture')
+        .populate('participants.user', 'name picture');
+        
+      if (!room) return;
+      
+      const activeParticipants = room.participants.filter(p => p.isActive);
+      
+      // Update participant count to ensure consistency
+      await Room.updateOne(
+        { _id: roomId },
+        { $set: { currentParticipants: activeParticipants.length } }
+      );
+      
+      const roomData = {
+        id: room._id,
+        name: room.name,
+        host: { id: room.host._id, name: room.host.name, picture: room.host.picture },
+        movie: room.movie,
+        videoFile: room.videoFile,
+        status: room.status,
+        playbackState: room.playbackState,
+        settings: room.settings,
+        participants: activeParticipants.map((p) => ({
+          user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
+          joinedAt: p.joinedAt,
+          isHost: p.isHost,
+          isActive: p.isActive,
+        })),
+      };
+      
+      socket.emit('room-sync', { room: roomData });
+      
+      // Also broadcast updated participant count to all room members
+      io.to(roomId).emit('participants-updated', {
+        participants: roomData.participants,
+        currentParticipants: activeParticipants.length,
+        roomId: roomId
+      });
+    } catch (error) {
+      console.error('[DEBUG] Room sync error:', error);
+    }
+  });
+
+  // Periodic room health check for hosts
+  socket.on('host-room-check', async (data) => {
+    try {
+      const { roomId } = data || {};
+      if (!socket.userId || !roomId) return;
+      
+      const room = await Room.findById(roomId);
+      if (!room || room.host.toString() !== socket.userId) return;
+      
+      // Broadcast room sync to all participants
+      const updatedRoom = await Room.findById(roomId)
+        .populate('host', 'name picture')
+        .populate('participants.user', 'name picture');
+        
+      if (updatedRoom) {
+        const activeParticipants = updatedRoom.participants.filter(p => p.isActive);
+        
+        // Update participant count
+        await Room.updateOne(
+          { _id: roomId },
+          { $set: { currentParticipants: activeParticipants.length } }
+        );
+        
+        const roomData = {
+          id: updatedRoom._id,
+          name: updatedRoom.name,
+          host: { id: updatedRoom.host._id, name: updatedRoom.host.name, picture: updatedRoom.host.picture },
+          movie: updatedRoom.movie,
+          videoFile: updatedRoom.videoFile,
+          status: updatedRoom.status,
+          playbackState: updatedRoom.playbackState,
+          settings: updatedRoom.settings,
+          participants: activeParticipants.map((p) => ({
+            user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
+            joinedAt: p.joinedAt,
+            isHost: p.isHost,
+            isActive: p.isActive,
+          })),
+        };
+        
+        io.to(roomId).emit('room-sync', { room: roomData });
+        io.to(roomId).emit('participants-updated', {
+          participants: roomData.participants,
+          currentParticipants: activeParticipants.length,
+          roomId: roomId
+        });
+      }
+    } catch (error) {
+      console.error('[DEBUG] Host room check error:', error);
+    }
+  });
+
+  // Add periodic room cleanup and sync
+  socket.on('force-room-sync', async (data) => {
+    try {
+      const { roomId } = data || {};
+      if (!socket.userId || !roomId) return;
+      
+      const room = await Room.findById(roomId)
+        .populate('host', 'name picture')
+        .populate('participants.user', 'name picture');
+        
+      if (!room) return;
+      
+      const activeParticipants = room.participants.filter(p => p.isActive);
+      
+      // Force update participant count
+      await Room.updateOne(
+        { _id: roomId },
+        { $set: { currentParticipants: activeParticipants.length } }
+      );
+      
+      const roomData = {
+        id: room._id,
+        name: room.name,
+        host: { id: room.host._id, name: room.host.name, picture: room.host.picture },
+        movie: room.movie,
+        videoFile: room.videoFile,
+        status: room.status,
+        playbackState: room.playbackState,
+        settings: room.settings,
+        participants: activeParticipants.map((p) => ({
+          user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
+          joinedAt: p.joinedAt,
+          isHost: p.isHost,
+          isActive: p.isActive,
+        })),
+      };
+      
+      // Force sync to all room members
+      io.to(roomId).emit('room-sync', { room: roomData });
+      io.to(roomId).emit('participants-updated', {
+        participants: roomData.participants,
+        currentParticipants: activeParticipants.length,
+        roomId: roomId
+      });
+    } catch (error) {
+      console.error('[DEBUG] Force room sync error:', error);
     }
   });
 
