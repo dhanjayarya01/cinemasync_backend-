@@ -110,7 +110,6 @@ io.on('connection', (socket) => {
         console.log('[DEBUG] Join room failed: Not authenticated');
         return socket.emit('error', { error: 'Not authenticated' });
       }
-      
       let room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
@@ -118,7 +117,6 @@ io.on('connection', (socket) => {
         console.log('[DEBUG] Join room failed: Room not found', roomId);
         return socket.emit('error', { error: 'Room not found' });
       }
-      
       console.log('[DEBUG] Room found:', { roomId, isPrivate: room.isPrivate, hostId: room.host._id });
       const canJoin = room.canUserJoin(socket.userId);
       console.log('[DEBUG] Can join check:', canJoin);
@@ -126,103 +124,59 @@ io.on('connection', (socket) => {
         console.log('[DEBUG] Join room failed: Cannot join -', canJoin.reason);
         return socket.emit('error', { error: canJoin.reason });
       }
-      
       console.log('[DEBUG] Joining socket room and updating database...');
       socket.join(roomId);
       socket.roomId = roomId;
-      
-      // Use atomic operations to prevent race conditions
-      const existingParticipant = room.participants.find(p => p.user._id.toString() === socket.userId);
-      
-      if (!existingParticipant) {
-        // Add new participant atomically
-        await Room.updateOne(
-          { _id: roomId },
-          {
-            $addToSet: {
-              participants: {
-                user: socket.userId,
-                joinedAt: new Date(),
-                isHost: false,
-                isActive: true,
-                lastSeen: new Date(),
-              },
-            }
-          }
-        );
-      } else {
-        // Update existing participant
-        await Room.updateOne(
-          { _id: roomId, 'participants.user': socket.userId },
-          { 
-            $set: { 
-              'participants.$.isActive': true, 
-              'participants.$.lastSeen': new Date() 
-            }
-          }
-        );
-      }
-      
-      // Get updated room data and recalculate participants count
+      await Room.updateOne(
+        { _id: roomId, 'participants.user': { $ne: socket.userId } },
+        {
+          $addToSet: {
+            participants: {
+              user: socket.userId,
+              joinedAt: new Date(),
+              isHost: false,
+              isActive: true,
+              lastSeen: new Date(),
+            },
+          },
+        }
+      );
+      await Room.updateOne(
+        { _id: roomId, 'participants.user': socket.userId },
+        { $set: { 'participants.$.isActive': true, 'participants.$.lastSeen': new Date() } }
+      );
       room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
-      
-      const activeParticipants = room.participants.filter(p => p.isActive);
-      
-      // Update current participants count atomically
-      await Room.updateOne(
-        { _id: roomId },
-        { $set: { currentParticipants: activeParticipants.length } }
-      );
-      
       console.log('[DEBUG] Emitting room-joined event...');
-      
-      const roomData = {
-        id: room._id,
-        name: room.name,
-        host: { id: room.host._id, name: room.host.name, picture: room.host.picture },
-        movie: room.movie,
-        videoFile: room.videoFile,
-        status: room.status,
-        playbackState: room.playbackState,
-        settings: room.settings,
-        participants: activeParticipants.map((p) => ({
-          user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
-          joinedAt: p.joinedAt,
-          isHost: p.isHost,
-          isActive: p.isActive,
-        })),
-      };
-      
-      // Send to joining user first
-      socket.emit('room-joined', { room: roomData });
-      
-      // Immediate broadcast to all users in room with updated participant count
-      io.to(roomId).emit('participants-updated', {
-        participants: roomData.participants,
-        currentParticipants: activeParticipants.length,
-        roomId: roomId
+      socket.emit('room-joined', {
+        room: {
+          id: room._id,
+          name: room.name,
+          host: { id: room.host._id, name: room.host.name, picture: room.host.picture },
+          movie: room.movie,
+          videoFile: room.videoFile,
+          status: room.status,
+          playbackState: room.playbackState,
+          settings: room.settings,
+          participants: room.participants.map((p) => ({
+            user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
+            joinedAt: p.joinedAt,
+            isHost: p.isHost,
+            isActive: p.isActive,
+          })),
+        },
       });
-      
-      // Notify others about new user with complete room data
       socket.to(roomId).emit('user-joined', {
         user: socket.user,
         userId: socket.userId,
-        participants: roomData.participants,
-        currentParticipants: activeParticipants.length
+        participants: room.participants.map((p) => ({
+          user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
+          isHost: p.isHost,
+          isActive: p.isActive,
+        })),
       });
-      
-      // Force room sync to all clients after join
-      setTimeout(() => {
-        io.to(roomId).emit('room-sync', { room: roomData });
-      }, 200);
-      
-      // WebRTC peer notification with delay to ensure socket room is ready
-      setTimeout(() => {
-        socket.to(roomId).emit('peer-joined', { peerId: socket.userId, peerName: socket.user.name });
-      }, 500);
-      
+      socket.to(roomId).emit('peer-joined', { peerId: socket.userId, peerName: socket.user.name });
     } catch (error) {
       console.error('[DEBUG] Join room error:', error);
       socket.emit('error', { error: 'Failed to join room' });
@@ -403,157 +357,6 @@ io.on('connection', (socket) => {
       from: socket.userId,
     });
     if (delivered === 0) {
-    }
-  });
-
-  // Handle room sync requests
-  socket.on('request-room-sync', async (data) => {
-    try {
-      const { roomId } = data || {};
-      if (!socket.userId || !roomId) return;
-      
-      const room = await Room.findById(roomId)
-        .populate('host', 'name picture')
-        .populate('participants.user', 'name picture');
-        
-      if (!room) return;
-      
-      const activeParticipants = room.participants.filter(p => p.isActive);
-      
-      // Update participant count to ensure consistency
-      await Room.updateOne(
-        { _id: roomId },
-        { $set: { currentParticipants: activeParticipants.length } }
-      );
-      
-      const roomData = {
-        id: room._id,
-        name: room.name,
-        host: { id: room.host._id, name: room.host.name, picture: room.host.picture },
-        movie: room.movie,
-        videoFile: room.videoFile,
-        status: room.status,
-        playbackState: room.playbackState,
-        settings: room.settings,
-        participants: activeParticipants.map((p) => ({
-          user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
-          joinedAt: p.joinedAt,
-          isHost: p.isHost,
-          isActive: p.isActive,
-        })),
-      };
-      
-      socket.emit('room-sync', { room: roomData });
-      
-      // Also broadcast updated participant count to all room members
-      io.to(roomId).emit('participants-updated', {
-        participants: roomData.participants,
-        currentParticipants: activeParticipants.length,
-        roomId: roomId
-      });
-    } catch (error) {
-      console.error('[DEBUG] Room sync error:', error);
-    }
-  });
-
-  // Periodic room health check for hosts
-  socket.on('host-room-check', async (data) => {
-    try {
-      const { roomId } = data || {};
-      if (!socket.userId || !roomId) return;
-      
-      const room = await Room.findById(roomId);
-      if (!room || room.host.toString() !== socket.userId) return;
-      
-      // Broadcast room sync to all participants
-      const updatedRoom = await Room.findById(roomId)
-        .populate('host', 'name picture')
-        .populate('participants.user', 'name picture');
-        
-      if (updatedRoom) {
-        const activeParticipants = updatedRoom.participants.filter(p => p.isActive);
-        
-        // Update participant count
-        await Room.updateOne(
-          { _id: roomId },
-          { $set: { currentParticipants: activeParticipants.length } }
-        );
-        
-        const roomData = {
-          id: updatedRoom._id,
-          name: updatedRoom.name,
-          host: { id: updatedRoom.host._id, name: updatedRoom.host.name, picture: updatedRoom.host.picture },
-          movie: updatedRoom.movie,
-          videoFile: updatedRoom.videoFile,
-          status: updatedRoom.status,
-          playbackState: updatedRoom.playbackState,
-          settings: updatedRoom.settings,
-          participants: activeParticipants.map((p) => ({
-            user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
-            joinedAt: p.joinedAt,
-            isHost: p.isHost,
-            isActive: p.isActive,
-          })),
-        };
-        
-        io.to(roomId).emit('room-sync', { room: roomData });
-        io.to(roomId).emit('participants-updated', {
-          participants: roomData.participants,
-          currentParticipants: activeParticipants.length,
-          roomId: roomId
-        });
-      }
-    } catch (error) {
-      console.error('[DEBUG] Host room check error:', error);
-    }
-  });
-
-  // Add periodic room cleanup and sync
-  socket.on('force-room-sync', async (data) => {
-    try {
-      const { roomId } = data || {};
-      if (!socket.userId || !roomId) return;
-      
-      const room = await Room.findById(roomId)
-        .populate('host', 'name picture')
-        .populate('participants.user', 'name picture');
-        
-      if (!room) return;
-      
-      const activeParticipants = room.participants.filter(p => p.isActive);
-      
-      // Force update participant count
-      await Room.updateOne(
-        { _id: roomId },
-        { $set: { currentParticipants: activeParticipants.length } }
-      );
-      
-      const roomData = {
-        id: room._id,
-        name: room.name,
-        host: { id: room.host._id, name: room.host.name, picture: room.host.picture },
-        movie: room.movie,
-        videoFile: room.videoFile,
-        status: room.status,
-        playbackState: room.playbackState,
-        settings: room.settings,
-        participants: activeParticipants.map((p) => ({
-          user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
-          joinedAt: p.joinedAt,
-          isHost: p.isHost,
-          isActive: p.isActive,
-        })),
-      };
-      
-      // Force sync to all room members
-      io.to(roomId).emit('room-sync', { room: roomData });
-      io.to(roomId).emit('participants-updated', {
-        participants: roomData.participants,
-        currentParticipants: activeParticipants.length,
-        roomId: roomId
-      });
-    } catch (error) {
-      console.error('[DEBUG] Force room sync error:', error);
     }
   });
 
