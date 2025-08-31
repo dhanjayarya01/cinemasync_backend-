@@ -1,4 +1,3 @@
-
 import express from 'express';
 import http from 'http';
 import { Server as socketIo } from 'socket.io';
@@ -69,6 +68,32 @@ function emitToUserInSameRoom(userId, roomId, event, payload) {
   return count;
 }
 
+/**
+ * Build canonical payloads used for room events
+ */
+function buildParticipantsPayload(room) {
+  return room.participants.map((p) => ({
+    user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
+    joinedAt: p.joinedAt,
+    isHost: p.isHost,
+    isActive: p.isActive,
+  }));
+}
+
+function buildRoomInfoPayload(room) {
+  return {
+    id: room._id,
+    name: room.name,
+    host: room.host ? { id: room.host._id, name: room.host.name, picture: room.host.picture } : null,
+    movie: room.movie,
+    videoFile: room.videoFile,
+    status: room.status,
+    playbackState: room.playbackState,
+    settings: room.settings,
+    participants: buildParticipantsPayload(room),
+  };
+}
+
 io.on('connection', (socket) => {
   console.log('[DEBUG] New socket connection:', socket.id);
   socket.userId = null;
@@ -97,7 +122,7 @@ io.on('connection', (socket) => {
       console.log('[DEBUG] Authentication successful:', { userId: socket.userId, userName: user.name });
       socket.emit('authenticated', { user: socket.user });
     } catch (error) {
-      console.log('[DEBUG] Authentication error:', error.message);
+      console.log('[DEBUG] Authentication error:', error?.message || error);
       socket.emit('auth-error', { error: 'Authentication failed' });
     }
   });
@@ -110,23 +135,28 @@ io.on('connection', (socket) => {
         console.log('[DEBUG] Join room failed: Not authenticated');
         return socket.emit('error', { error: 'Not authenticated' });
       }
+
       let room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
+
       if (!room) {
         console.log('[DEBUG] Join room failed: Room not found', roomId);
         return socket.emit('error', { error: 'Room not found' });
       }
-      console.log('[DEBUG] Room found:', { roomId, isPrivate: room.isPrivate, hostId: room.host._id });
+
+      console.log('[DEBUG] Room found:', { roomId, isPrivate: room.isPrivate, hostId: room.host?._id });
       const canJoin = room.canUserJoin(socket.userId);
       console.log('[DEBUG] Can join check:', canJoin);
       if (!canJoin.canJoin) {
         console.log('[DEBUG] Join room failed: Cannot join -', canJoin.reason);
         return socket.emit('error', { error: canJoin.reason });
       }
-      console.log('[DEBUG] Joining socket room and updating database...');
+
+      console.log('[DEBUG] Joining socket.io room and updating DB...');
       socket.join(roomId);
       socket.roomId = roomId;
+
       await Room.updateOne(
         { _id: roomId, 'participants.user': { $ne: socket.userId } },
         {
@@ -145,38 +175,37 @@ io.on('connection', (socket) => {
         { _id: roomId, 'participants.user': socket.userId },
         { $set: { 'participants.$.isActive': true, 'participants.$.lastSeen': new Date() } }
       );
+
+      // re-fetch canonical room
       room = await Room.findById(roomId)
         .populate('host', 'name picture')
         .populate('participants.user', 'name picture');
-      console.log('[DEBUG] Emitting room-joined event...');
-      socket.emit('room-joined', {
-        room: {
-          id: room._id,
-          name: room.name,
-          host: { id: room.host._id, name: room.host.name, picture: room.host.picture },
-          movie: room.movie,
-          videoFile: room.videoFile,
-          status: room.status,
-          playbackState: room.playbackState,
-          settings: room.settings,
-          participants: room.participants.map((p) => ({
-            user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
-            joinedAt: p.joinedAt,
-            isHost: p.isHost,
-            isActive: p.isActive,
-          })),
-        },
-      });
+
+      console.log('[DEBUG] Emitting room-joined event to joiner...');
+      socket.emit('room-joined', { room: buildRoomInfoPayload(room) });
+
+      // notify others (exclude joiner) about the join
       socket.to(roomId).emit('user-joined', {
         user: socket.user,
         userId: socket.userId,
-        participants: room.participants.map((p) => ({
-          user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
-          isHost: p.isHost,
-          isActive: p.isActive,
-        })),
+        participants: buildParticipantsPayload(room),
       });
       socket.to(roomId).emit('peer-joined', { peerId: socket.userId, peerName: socket.user.name });
+
+      // Debug: list sockets currently in the room
+      try {
+        const roomSockets = io.sockets.adapter.rooms.get(roomId);
+        console.log('[DEBUG] Sockets in room', roomId, roomSockets ? Array.from(roomSockets) : []);
+      } catch (err) {
+        // ignore
+      }
+
+      // --- NEW: broadcast canonical participants + full room info to everyone (including host) ---
+      console.log('[DEBUG] Broadcasting canonical participants & room-info to room:', roomId);
+      io.in(roomId).emit('participants-updated', { participants: buildParticipantsPayload(room) });
+      io.in(roomId).emit('room-info', buildRoomInfoPayload(room));
+      // --------------------------------------------------------------------------------------------
+
     } catch (error) {
       console.error('[DEBUG] Join room error:', error);
       socket.emit('error', { error: 'Failed to join room' });
@@ -186,11 +215,14 @@ io.on('connection', (socket) => {
   socket.on('leave-room', async () => {
     try {
       if (!socket.roomId || !socket.userId) return;
-      const room = await Room.findById(socket.roomId);
+      const roomId = socket.roomId;
+      const room = await Room.findById(roomId);
       if (room) {
         await room.removeParticipant(socket.userId);
-        const updatedRoom = await Room.findById(socket.roomId).populate('participants.user', 'name picture');
-        socket.to(socket.roomId).emit('user-left', {
+        const updatedRoom = await Room.findById(roomId).populate('participants.user', 'name picture');
+
+        // notify others (exclude leaver)
+        socket.to(roomId).emit('user-left', {
           user: socket.user,
           participants: updatedRoom.participants.map((p) => ({
             user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
@@ -198,11 +230,16 @@ io.on('connection', (socket) => {
             isActive: p.isActive,
           })),
         });
-        socket.to(socket.roomId).emit('peer-left', { peerId: socket.userId, peerName: socket.user?.name });
+        socket.to(roomId).emit('peer-left', { peerId: socket.userId, peerName: socket.user?.name });
+
+        // broadcast canonical updates to everyone (including host)
+        io.in(roomId).emit('participants-updated', { participants: buildParticipantsPayload(updatedRoom) });
+        io.in(roomId).emit('room-info', buildRoomInfoPayload(updatedRoom));
       }
-      socket.leave(socket.roomId);
+      socket.leave(roomId);
       socket.roomId = null;
     } catch (error) {
+      console.error('[DEBUG] leave-room error:', error);
     }
   });
 
@@ -215,6 +252,7 @@ io.on('connection', (socket) => {
       await room.updatePlaybackState({ isPlaying: true, currentTime });
       socket.to(socket.roomId).emit('video-play', { currentTime });
     } catch (error) {
+      console.error('[DEBUG] video-play error:', error);
     }
   });
 
@@ -226,6 +264,7 @@ io.on('connection', (socket) => {
       await room.updatePlaybackState({ isPlaying: false });
       socket.to(socket.roomId).emit('video-pause');
     } catch (error) {
+      console.error('[DEBUG] video-pause error:', error);
     }
   });
 
@@ -238,6 +277,7 @@ io.on('connection', (socket) => {
       await room.updatePlaybackState({ currentTime: time });
       socket.to(socket.roomId).emit('video-seek', { time });
     } catch (error) {
+      console.error('[DEBUG] video-seek error:', error);
     }
   });
 
@@ -250,6 +290,7 @@ io.on('connection', (socket) => {
       await room.save();
       socket.to(socket.roomId).emit('video-metadata', { name: data.name, size: data.size, type: data.type, url: data.url });
     } catch (error) {
+      console.error('[DEBUG] video-metadata error:', error);
     }
   });
 
@@ -278,6 +319,7 @@ io.on('connection', (socket) => {
       if (callback) callback({ success: true, message: 'Voice message sent' });
     } catch (error) {
       if (callback) callback({ success: false, error: error.message });
+      console.error('[DEBUG] voice-message error:', error);
     }
   });
 
@@ -286,7 +328,6 @@ io.on('connection', (socket) => {
     if (!socket.roomId || !socket.user) return;
     
     try {
-      // Relay live voice stream to all other participants in the room
       socket.to(socket.roomId).emit('live-voice-stream', {
         audioData: data.audioData,
         userId: socket.user.id,
@@ -318,6 +359,7 @@ io.on('connection', (socket) => {
         });
       }
     } catch (err) {
+      console.error('[DEBUG] host-video-state-request error:', err);
     }
   });
 
@@ -337,6 +379,7 @@ io.on('connection', (socket) => {
       from: socket.userId,
     });
     if (delivered === 0) {
+      // optionally queue or handle missing recipient
     }
   });
 
@@ -347,6 +390,7 @@ io.on('connection', (socket) => {
       from: socket.userId,
     });
     if (delivered === 0) {
+      // optionally queue or handle missing recipient
     }
   });
 
@@ -357,6 +401,7 @@ io.on('connection', (socket) => {
       from: socket.userId,
     });
     if (delivered === 0) {
+      // optionally queue or handle missing recipient
     }
   });
 
@@ -369,12 +414,16 @@ io.on('connection', (socket) => {
           await User.findByIdAndUpdate(socket.userId, { isOnline: false, lastSeen: new Date() });
         }
       }
+
       if (socket.roomId && socket.userId) {
-        const room = await Room.findById(socket.roomId);
+        const roomId = socket.roomId;
+        const room = await Room.findById(roomId);
         if (room) {
           await room.removeParticipant(socket.userId);
-          const updatedRoom = await Room.findById(socket.roomId).populate('participants.user', 'name picture');
-          socket.to(socket.roomId).emit('user-left', {
+          const updatedRoom = await Room.findById(roomId).populate('participants.user', 'name picture');
+
+          // notify others (exclude disconnected socket)
+          socket.to(roomId).emit('user-left', {
             user: socket.user,
             participants: updatedRoom.participants.map((p) => ({
               user: { id: p.user._id, name: p.user.name, picture: p.user.picture },
@@ -382,10 +431,15 @@ io.on('connection', (socket) => {
               isActive: p.isActive,
             })),
           });
-          socket.to(socket.roomId).emit('peer-left', { peerId: socket.userId, peerName: socket.user?.name });
+          socket.to(roomId).emit('peer-left', { peerId: socket.userId, peerName: socket.user?.name });
+
+          // broadcast canonical participants + room-info to everyone (including host)
+          io.in(roomId).emit('participants-updated', { participants: buildParticipantsPayload(updatedRoom) });
+          io.in(roomId).emit('room-info', buildRoomInfoPayload(updatedRoom));
         }
       }
     } catch (error) {
+      console.error('[DEBUG] disconnect handler error:', error);
     }
   });
 });
