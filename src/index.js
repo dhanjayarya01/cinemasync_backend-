@@ -9,6 +9,7 @@ import authRoutes from './routes/auth.js';
 import roomRoutes from './routes/rooms.js';
 import Room from './models/Room.js';
 import User from './models/User.js';
+import { Console } from 'console';
 
 dotenv.config();
 
@@ -70,7 +71,7 @@ function emitToUserInSameRoom(userId, roomId, event, payload) {
 }
 
 io.on('connection', (socket) => {
-  console.log('[DEBUG] New socket connection:', socket.id);
+  console.log('[io] New socket connection:', socket.id);
   socket.userId = null;
   socket.user = null;
   socket.roomId = null;
@@ -167,6 +168,10 @@ io.on('connection', (socket) => {
           })),
         },
       });
+
+      console.log('User joined:', socket.user);
+     
+
       socket.to(roomId).emit('user-joined', {
         user: socket.user,
         userId: socket.userId,
@@ -176,7 +181,10 @@ io.on('connection', (socket) => {
           isActive: p.isActive,
         })),
       });
+      console.log('User emited for other user :', socket.user)
+      
       socket.to(roomId).emit('peer-joined', { peerId: socket.userId, peerName: socket.user.name });
+      console.log('User emited pear join for other user :', socket.user)
     } catch (error) {
       console.error('[DEBUG] Join room error:', error);
       socket.emit('error', { error: 'Failed to join room' });
