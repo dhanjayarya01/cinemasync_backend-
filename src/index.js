@@ -368,6 +368,11 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('peer-ready', (data) => {
+    if (!socket.userId || !socket.roomId) return;
+    socket.to(socket.roomId).emit('peer-ready', { peerId: socket.userId });
+  });
+
   socket.on('disconnect', async () => {
     try {
       if (socket.userId) {
