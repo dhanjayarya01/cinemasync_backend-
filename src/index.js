@@ -169,9 +169,9 @@ io.on('connection', (socket) => {
         },
       });
 
-      console.log('User joined:', socket.user);
+      console.log('[DEBUG] User joined:', socket.user);
      
-
+      // Emit to other users in the room
       socket.to(roomId).emit('user-joined', {
         user: socket.user,
         userId: socket.userId,
@@ -181,10 +181,14 @@ io.on('connection', (socket) => {
           isActive: p.isActive,
         })),
       });
-      console.log('User emited for other user :', socket.user)
+      console.log('[DEBUG] User emitted for other users:', socket.user);
       
-      socket.to(roomId).emit('peer-joined', { peerId: socket.userId, peerName: socket.user.name });
-      console.log('User emited pear join for other user :', socket.user)
+      // Add delay before WebRTC signaling to ensure room state is settled
+      setTimeout(() => {
+        socket.to(roomId).emit('peer-joined', { peerId: socket.userId, peerName: socket.user.name });
+        console.log('[DEBUG] Peer join signal emitted for:', socket.user);
+      }, 1000);
+      
     } catch (error) {
       console.error('[DEBUG] Join room error:', error);
       socket.emit('error', { error: 'Failed to join room' });
@@ -339,38 +343,52 @@ io.on('connection', (socket) => {
   });
 
   socket.on('offer', (data) => {
+    console.log('[WebRTC] Offer from', socket.userId, 'to', data.to);
     if (!socket.userId || !socket.roomId) return;
     const delivered = emitToUserInSameRoom(data.to, socket.roomId, 'offer', {
       offer: data.offer,
       from: socket.userId,
     });
     if (delivered === 0) {
+      console.log('[WebRTC] Failed to deliver offer to', data.to);
+    } else {
+      console.log('[WebRTC] Offer delivered to', data.to);
     }
   });
 
   socket.on('answer', (data) => {
+    console.log('[WebRTC] Answer from', socket.userId, 'to', data.to);
     if (!socket.userId || !socket.roomId) return;
     const delivered = emitToUserInSameRoom(data.to, socket.roomId, 'answer', {
       answer: data.answer,
       from: socket.userId,
     });
     if (delivered === 0) {
+      console.log('[WebRTC] Failed to deliver answer to', data.to);
+    } else {
+      console.log('[WebRTC] Answer delivered to', data.to);
     }
   });
 
   socket.on('ice-candidate', (data) => {
+    console.log('[WebRTC] ICE candidate from', socket.userId, 'to', data.to);
     if (!socket.userId || !socket.roomId) return;
     const delivered = emitToUserInSameRoom(data.to, socket.roomId, 'ice-candidate', {
       candidate: data.candidate,
       from: socket.userId,
     });
     if (delivered === 0) {
+      console.log('[WebRTC] Failed to deliver ICE candidate to', data.to);
     }
   });
 
   socket.on('peer-ready', (data) => {
+    console.log('[WebRTC] Peer ready signal from', socket.userId);
     if (!socket.userId || !socket.roomId) return;
-    socket.to(socket.roomId).emit('peer-ready', { peerId: socket.userId });
+    socket.to(socket.roomId).emit('peer-ready', { 
+      peerId: socket.userId, 
+      from: socket.userId 
+    });
   });
 
   socket.on('disconnect', async () => {
@@ -399,6 +417,7 @@ io.on('connection', (socket) => {
         }
       }
     } catch (error) {
+      console.log("Error in disconnect", error);
     }
   });
 });
